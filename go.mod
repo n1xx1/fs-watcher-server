@@ -1,4 +1,4 @@
-module dev-helper
+module fs-watcher-server
 
 go 1.18
 
