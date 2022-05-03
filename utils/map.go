@@ -31,6 +31,12 @@ func (m *RWMap[K, V]) Set(k K, v V) {
 	m.l.Unlock()
 }
 
+func (m *RWMap[K, V]) Delete(k K) {
+	m.l.Lock()
+	delete(m.m, k)
+	m.l.Unlock()
+}
+
 func (m *RWMap[K, V]) Update(k K, f func(v V) V) {
 	m.l.Lock()
 	m.m[k] = f(m.m[k])
