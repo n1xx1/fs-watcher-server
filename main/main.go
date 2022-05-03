@@ -2,14 +2,12 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
-	"fmt"
 	"fs-watcher-server/utils"
 	"fs-watcher-server/watcher"
 	"github.com/adrg/frontmatter"
 	"github.com/fsnotify/fsnotify"
+	"github.com/labstack/echo/v4"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -37,7 +35,7 @@ func (v *FileData) makeLevel() *int {
 	return level
 }
 
-const baseDir = "C:\\Users\\n1xx1\\Development\\pfitdb-hugo\\content"
+const baseDir = "C:\\Users\\n1xx1\\Development\\n1xx1\\pfitdb\\pfitdb"
 
 var files = utils.NewRWMap[string, FileData]()
 var titleRegexp = regexp.MustCompile(`(?:^|\n)#+ (.+?)(?: - (.+?)(?: (\d+))?)?(?:$|\n)`)
@@ -46,9 +44,14 @@ func readFile(fileName string) {
 	rel, _ := filepath.Rel(baseDir, fileName)
 	file := filepath.ToSlash(rel)
 
+	s, err := os.Stat(fileName)
+	if s.IsDir() {
+		return
+	}
+
 	data, err := os.ReadFile(fileName)
 	if err != nil {
-		log.Fatal(err)
+		return
 	}
 
 	var matter map[any]any
@@ -91,23 +94,29 @@ func main() {
 	}
 
 	go func() {
-		batcher := time.NewTimer(100 * time.Millisecond)
-		batches := map[string][]fsnotify.Event{}
+		batcher := time.NewTicker(100 * time.Millisecond)
+		var batches []fsnotify.Event
 
 		for {
 			select {
 			case <-batcher.C:
-				for _, es := range batches {
-					for _, e := range es {
-						switch e.Op {
-						case watcher.Write:
-							go readFile(e.Name)
-						}
+				for _, e := range batches {
+					switch {
+					case e.Op&fsnotify.Write != 0:
+						log.Printf("%s [%v]", e.Name, e.Op)
+						go readFile(e.Name)
 					}
 				}
-				batches = map[string][]fsnotify.Event{}
+				batches = nil
 			case e := <-w.Events:
-				batches[e.Name] = append(batches[e.Name], e)
+				for _, b := range batches {
+					if b.Name == e.Name && b.Op == e.Op {
+						goto dontadd
+					}
+				}
+				batches = append(batches, e)
+			dontadd:
+				;
 			case e := <-w.Errors:
 				log.Printf("error: %v", e)
 			}
@@ -137,138 +146,15 @@ func main() {
 		log.Fatalf("watcher: %v", err)
 	}
 
-	http.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
-		type FileEntry struct {
-			Frontmatter map[string]any `json:"frontmatter"`
-			Title       string         `json:"title"`
-			Level       *int           `json:"level,omitempty"`
-			Type        string         `json:"type,omitempty"`
-			Contents    string         `json:"contents"`
-		}
+	e := echo.New()
 
-		k := r.URL.Query().Get("k")
-
-		v, ok := files.TryGet(k + ".md")
-		if !ok {
-			v, ok = files.TryGet(k + "/_index.md")
-			if !ok {
-				w.WriteHeader(404)
-				_, _ = w.Write([]byte("Not found!"))
-				return
-			}
-		}
-		resp := FileEntry{
-			Frontmatter: v.frontmatter,
-			Title:       v.title,
-			Level:       v.makeLevel(),
-			Type:        v.typ,
-			Contents:    v.contents,
-		}
-
-		respBytes, err := json.Marshal(&resp)
-		if err != nil {
-			w.WriteHeader(500)
-			_, _ = fmt.Fprintf(w, "%v", err)
-			return
-		}
-
-		w.Header().Set("content-type", "application/json")
-		w.WriteHeader(200)
-		_, _ = w.Write(respBytes)
-	})
-
-	http.HandleFunc("/all", func(w http.ResponseWriter, r *http.Request) {
-		type FileEntry struct {
-			Frontmatter map[string]any `json:"frontmatter"`
-			Title       string         `json:"title"`
-			Level       *int           `json:"level,omitempty"`
-			Type        string         `json:"type,omitempty"`
-			Index       bool           `json:"index,omitempty"`
-		}
-		resp := map[string]FileEntry{}
-
-		for k, v := range files.Copy() {
-			path, index := getRealFileName(k)
-			resp[path] = FileEntry{
-				Frontmatter: v.frontmatter,
-				Title:       v.title,
-				Level:       v.makeLevel(),
-				Type:        v.typ,
-				Index:       index,
-			}
-		}
-
-		respBytes, err := json.Marshal(&resp)
-		if err != nil {
-			w.WriteHeader(500)
-			_, _ = fmt.Fprintf(w, "%v", err)
-			return
-		}
-
-		w.Header().Set("content-type", "application/json")
-		w.WriteHeader(200)
-		_, _ = w.Write(respBytes)
-	})
-
-	http.HandleFunc("/tree", func(w http.ResponseWriter, r *http.Request) {
-		type FileEntry struct {
-			Frontmatter map[string]any        `json:"frontmatter"`
-			Title       string                `json:"title"`
-			Level       *int                  `json:"level,omitempty"`
-			Type        string                `json:"type,omitempty"`
-			Path        string                `json:"path"`
-			Children    map[string]*FileEntry `json:"children,omitempty"`
-		}
-
-		var resp FileEntry
-
-		respBytes, err := json.Marshal(&resp)
-		if err != nil {
-			w.WriteHeader(500)
-			_, _ = fmt.Fprintf(w, "%v", err)
-			return
-		}
-
-		for k, v := range files.Copy() {
-			path, _ := getRealFileName(k)
-			parts := strings.Split(path, "/")
-
-			var entry *FileEntry
-			for i, p := range parts {
-				if entry == nil {
-					panic("what")
-				}
-				if p == "" {
-					entry = &resp
-				} else {
-					if entry.Children == nil {
-						entry.Children = map[string]*FileEntry{}
-					}
-					newEntry := entry.Children[p]
-					if entry == nil {
-						newEntry = &FileEntry{
-							Path: strings.Join(parts[:i+1], "/"),
-						}
-						entry.Children[p] = newEntry
-					}
-					entry = newEntry
-				}
-			}
-
-			entry.Path = path
-			entry.Title = v.title
-			entry.Type = v.typ
-			entry.Frontmatter = v.frontmatter
-			entry.Level = v.makeLevel()
-		}
-
-		w.Header().Set("content-type", "application/json")
-		w.WriteHeader(200)
-		_, _ = w.Write(respBytes)
-	})
+	e.GET("/dirs", handleGetDirs)
+	e.GET("/get", handleGetGet)
+	e.GET("/all", handleGetAll)
+	e.GET("/tree", handleGetTree)
 
 	log.Print("Listening on http://127.0.0.1:8090")
-	_ = http.ListenAndServe(":8090", nil)
+	e.Logger.Fatal(e.Start(":8090"))
 }
 
 func getRealFileName(f string) (name string, index bool) {
