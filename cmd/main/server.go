@@ -29,7 +29,7 @@ type FsServer struct {
 type fsFileData struct {
 	Path     string
 	Rel      string
-	Contents []byte
+	Contents string
 	Meta     any
 }
 
@@ -67,7 +67,7 @@ func (s *FsServer) updateFile(fileName string) {
 	entry := fsFileData{
 		Path:     fileName,
 		Rel:      file,
-		Contents: data,
+		Contents: string(data),
 	}
 	if strings.HasSuffix(fileName, ".md") || strings.HasSuffix(fileName, ".mdx") {
 		var matter map[any]any
@@ -83,7 +83,7 @@ func (s *FsServer) updateFile(fileName string) {
 }
 
 func (s *FsServer) startWatcher() {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	var updateQueue []string
 
 	for {
@@ -123,7 +123,7 @@ func (s *FsServer) startWatcher() {
 	}
 }
 
-func (s *FsServer) isIgnoredDir(walkPath string, d os.DirEntry) bool {
+func (s *FsServer) isIgnored(walkPath string, d os.DirEntry) bool {
 	n := d.Name()
 	if strings.HasSuffix(n, "~") || strings.HasPrefix(n, ".") {
 		return true
@@ -132,30 +132,44 @@ func (s *FsServer) isIgnoredDir(walkPath string, d os.DirEntry) bool {
 }
 
 func (s *FsServer) watchRecursive(path string, remove bool) error {
+	var updateQueue []string
 	err := filepath.WalkDir(path, func(walkPath string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if s.isIgnored(walkPath, d) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if d.IsDir() {
 			if remove {
 				if err = s.watcher.Remove(walkPath); err != nil {
 					return err
 				}
-			} else if !s.isIgnoredDir(walkPath, d) {
+			} else {
 				if err = s.watcher.Add(walkPath); err != nil {
 					return err
 				}
-			} else {
-				return filepath.SkipDir
 			}
+		} else {
+			updateQueue = append(updateQueue, walkPath)
 		}
 		return nil
 	})
+	for _, f := range updateQueue {
+		s.updateFile(f)
+	}
 	return err
 }
 
 func (s *FsServer) Start() (err error) {
 	s.watcher, err = fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("watcher: %w", err)
+	}
+	err = s.watchRecursive(s.Base, false)
 	if err != nil {
 		return fmt.Errorf("watcher: %w", err)
 	}
@@ -165,8 +179,13 @@ func (s *FsServer) Start() (err error) {
 	e := echo.New()
 	e.Match([]string{"GET", "POST"}, "/readFile", s.handleReadFile)
 	e.Match([]string{"GET", "POST"}, "/readdir", s.handleReadDir)
+	e.Match([]string{"GET", "POST"}, "/all", s.handleAll)
 
 	return e.Start(fmt.Sprintf(":%d", s.Port))
+}
+
+func (s *FsServer) handleAll(c echo.Context) (err error) {
+	return c.String(200, s.loadedFiles.GetRepr())
 }
 
 func (s *FsServer) handleReadDir(c echo.Context) (err error) {
@@ -196,7 +215,7 @@ func (s *FsServer) handleReadDir(c echo.Context) (err error) {
 		type respEntry struct {
 			Dir      bool   `json:"dir"`
 			Path     string `json:"path"`
-			Contents string `json:"contents"`
+			Contents string `json:"contents,omitempty"`
 			Meta     any    `json:"meta,omitempty"`
 		}
 
